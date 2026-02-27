@@ -41,6 +41,7 @@ use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi as abi;
 use crate::mnt::Mount;
 use crate::mnt::mount_options::Config;
+use crate::mnt::mount_options::check_option_conflicts;
 use crate::notify::Notifier;
 use crate::read_buf::FuseReadBuf;
 use crate::reply::Reply;
@@ -123,8 +124,8 @@ impl Drop for UmountOnDrop {
 /// The session data structure
 #[derive(Debug)]
 pub struct Session<FS: Filesystem> {
-    /// Filesystem operation implementations. None after `destroy` called.
-    pub(crate) filesystem: FilesystemHolder<FS>,
+    /// Filesystem operation implementations.
+    pub(crate) filesystem: FS,
     /// Communication channel to the kernel driver
     pub(crate) ch: Channel,
     /// Handle to the mount.  Dropping this unmounts.
@@ -155,6 +156,8 @@ impl<FS: Filesystem> Session<FS> {
         mountpoint: P,
         options: &Config,
     ) -> io::Result<Session<FS>> {
+        check_option_conflicts(options)?;
+
         let mountpoint = mountpoint.as_ref();
         info!("Mounting {}", mountpoint.display());
         // If AutoUnmount is requested, but not AllowRoot or AllowOther, return an error
@@ -172,9 +175,7 @@ impl<FS: Filesystem> Session<FS> {
         let ch = Channel::new(file);
 
         let mut session = Session {
-            filesystem: FilesystemHolder {
-                fs: Some(filesystem),
-            },
+            filesystem,
             ch,
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(Some(mount))),
@@ -200,9 +201,7 @@ impl<FS: Filesystem> Session<FS> {
     ) -> io::Result<Self> {
         let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
         let mut session = Session {
-            filesystem: FilesystemHolder {
-                fs: Some(filesystem),
-            },
+            filesystem,
             ch,
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(None)),
@@ -240,7 +239,7 @@ impl<FS: Filesystem> Session<FS> {
     /// may run concurrent by spawning threads.
     /// # Errors
     /// Returns any final error when the session comes to an end.
-    pub(crate) fn run(self) -> io::Result<()> {
+    pub fn run(self) -> io::Result<()> {
         let Session {
             filesystem,
             ch,
@@ -264,7 +263,9 @@ impl<FS: Filesystem> Session<FS> {
             return Err(io::Error::other("n_threads"));
         };
 
-        let mut filesystem = Arc::new(filesystem);
+        let mut filesystem = Arc::new(FilesystemHolder {
+            fs: Some(filesystem),
+        });
 
         let mut channels = Vec::with_capacity(n_threads);
 
@@ -412,13 +413,9 @@ impl<FS: Filesystem> Session<FS> {
             let mut config = KernelConfig::new(init.capabilities(), init.max_readahead(), v);
 
             // Call filesystem init method and give it a chance to return an error
-            let Some(filesystem) = &mut self.filesystem.fs else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Bug: filesystem must be initialized during handshake",
-                ));
-            };
-            let res = filesystem.init(Request::ref_cast(request.header()), &mut config);
+            let res = self
+                .filesystem
+                .init(Request::ref_cast(request.header()), &mut config);
             if let Err(error) = res {
                 let errno = Errno::from_i32(error.raw_os_error().unwrap_or(0));
                 <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
@@ -472,6 +469,11 @@ impl<FS: Filesystem> Session<FS> {
 
             return Ok(());
         }
+    }
+
+    /// The underlying [Filesystem]
+    pub fn filesystem(&self) -> &FS {
+        &self.filesystem
     }
 
     /// Unmount the filesystem
